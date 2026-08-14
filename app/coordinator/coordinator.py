@@ -2,20 +2,19 @@ import grpc
 
 from app.sharding.consistent_hash import ConsistentHashRing
 from app.grpc_service import shard_pb2, shard_pb2_grpc
+from app.core.query_cache import QueryCache
 
 
 class Coordinator:
-    def __init__(self, shard_addresses, timeout_seconds=2.0):
-        # timeout_seconds has a concrete justification: it must be long
-        # enough for a normal search under load, short enough that a
-        # single unreachable shard doesn't stall the whole query for the
-        # caller. 2s is a starting point, tuned later against real
-        # latency numbers from the Phase 10 load test, not a guess left
-        # unexamined.
+    def __init__(self, shard_addresses, timeout_seconds=2.0, cache=None):
         self._shard_addresses = shard_addresses
         self._timeout_seconds = timeout_seconds
         self._ring = ConsistentHashRing(virtual_nodes_per_shard=150)
         self._stubs = {}
+        # Cache is injectable (default: real QueryCache) so tests can swap
+        # in a fake/None cache without touching Redis - keeps tests fast
+        # and independent of whether Docker is running.
+        self._cache = cache if cache is not None else QueryCache()
 
         for shard_id, address in shard_addresses.items():
             self._ring.add_shard(shard_id)
@@ -31,17 +30,16 @@ class Coordinator:
             response = stub.Insert(request, timeout=self._timeout_seconds)
             return {"shard_id": shard_id, "item_id": response.item_id}
         except grpc.RpcError as e:
-            # Surfacing which shard failed and why, not swallowing it -
-            # a caller (or the API layer above this) needs to know insert
-            # didn't happen, not get a silent no-op.
             raise RuntimeError(
                 "insert failed on " + shard_id + ": " + e.code().name + " - " + e.details()
             )
 
     def search(self, query_vector, k=5):
-        # Fan-out: query ALL shards, since a query key has no natural
-        # shard affinity the way an insert's item_key does - the nearest
-        # neighbors could be on any shard. Results are merged after.
+        cached = self._cache.get(query_vector, k)
+        if cached is not None:
+            cached["from_cache"] = True
+            return cached
+
         all_results = []
         failed_shards = []
 
@@ -57,15 +55,16 @@ class Coordinator:
                         "shard_id": shard_id,
                     })
             except grpc.RpcError as e:
-                # A slow/unreachable shard must not block the whole query -
-                # record the failure, continue with the others, and report
-                # partial results plus which shards were unreachable so the
-                # caller can tell the difference between 'no results exist'
-                # and 'some results may be missing'.
                 failed_shards.append({"shard_id": shard_id, "error": e.code().name})
 
-        # cosine distance from hnswlib: LOWER is more similar, so ascending sort.
         all_results.sort(key=lambda r: r["score"])
         merged = all_results[:k]
+        result = {"results": merged, "failed_shards": failed_shards, "from_cache": False}
 
-        return {"results": merged, "failed_shards": failed_shards}
+        # Only cache clean results - a query that hit failed shards shouldn't
+        # be cached as if it were complete, or a later successful retry
+        # would be masked by a stale partial-failure result.
+        if not failed_shards:
+            self._cache.set(query_vector, k, result)
+
+        return result
